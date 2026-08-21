@@ -1,0 +1,9 @@
+# Built binaries
+/cs
+/dist/
+
+# Local agent settings
+/.claude/
+/claude-session-manager
+*.test
+coverage.out

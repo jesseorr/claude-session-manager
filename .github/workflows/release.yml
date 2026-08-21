@@ -1,0 +1,50 @@
+name: Release
+
+# Tag a commit to publish binaries:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          # go.mod says "go 1.26", so this resolves to the newest 1.26.x.
+          # check-latest skips the runner image's cached, older patch release.
+          check-latest: true
+          cache: true
+
+      - name: Test before publishing
+        run: go test ./...
+
+      - name: Build every platform
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*}
+            arch=${target#*/}
+            GOOS=$os GOARCH=$arch go build \
+              -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" \
+              -o "dist/cs-$os-$arch" .
+          done
+          cd dist && sha256sum cs-* > checksums.txt
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*

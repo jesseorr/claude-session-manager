@@ -1,0 +1,20 @@
+[
+ {"keys":"",       "label":"the list",              "hold":2.6},
+ {"keys":"j",      "label":"move down",             "hold":0.9},
+ {"keys":"j",      "label":"move down",             "hold":1.6},
+ {"keys":"v",      "label":"v - replay my prompts", "hold":2.6, "settle":0.8},
+ {"keys":"\\x1b",  "label":"esc back",              "hold":0.9},
+ {"keys":"s",      "label":"s - sort by size",      "hold":1.8},
+ {"keys":"s",      "label":"s - sort by turns",     "hold":1.8},
+ {"keys":"s",      "label":"s - group by project",  "hold":2.4},
+ {"keys":"s",      "label":"s - back to recent",    "hold":1.0},
+ {"keys":"/",      "label":"filter",                "hold":0.5},
+ {"keys":"q",      "label":"type q",                "hold":0.4},
+ {"keys":"u",      "label":"type u",                "hold":0.4},
+ {"keys":"e",      "label":"type e",                "hold":2.2},
+ {"keys":"\\x1b",  "label":"esc clears it",         "hold":1.2},
+ {"keys":"p",      "label":"p - bookmark it",       "hold":1.4},
+ {"keys":"P",      "label":"P - the bookmarks",     "hold":2.4},
+ {"keys":"\\x1b",  "label":"esc back",              "hold":1.0},
+ {"keys":"?",      "label":"? - the key list",      "hold":3.2, "settle":0.7}
+]
