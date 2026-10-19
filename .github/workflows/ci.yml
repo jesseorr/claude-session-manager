@@ -4,9 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    # Re-run govulncheck weekly so a new advisory surfaces without a commit.
-    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
