@@ -28,6 +28,9 @@ func TestRenamePreservesMtimeAndWins(t *testing.T) {
 	if s.Last != "where did I leave off" {
 		t.Fatalf("last prompt: %q", s.Last)
 	}
+	if want := time.Date(2026, 8, 18, 17, 10, 0, 0, time.UTC); !s.End.Equal(want) {
+		t.Fatalf("end should come from the last timestamp, not mtime: %v", s.End)
+	}
 
 	if err := rename(s, `new "quoted" title`); err != nil {
 		t.Fatal(err)

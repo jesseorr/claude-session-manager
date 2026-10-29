@@ -89,11 +89,14 @@ func scanFile(path string) *session {
 		}
 	}
 
-	custom := ""
+	custom, lastTS := "", ""
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 256*1024), 32*1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
+		if strings.Contains(line, `"timestamp":"`) {
+			lastTS = line
+		}
 		if s.Start.IsZero() && strings.Contains(line, `"timestamp":"`) {
 			if t, err := time.Parse(time.RFC3339, jsonStr(line, "timestamp")); err == nil {
 				s.Start = t.Local()
@@ -117,6 +120,12 @@ func scanFile(path string) *session {
 	}
 	if custom != "" {
 		s.Title = custom
+	}
+	// Resuming appends untimestamped bookkeeping (last-prompt, cost-state, …)
+	// that bumps the mtime without any conversation happening, so "last" is
+	// the last timestamped record. mtime is only the fallback.
+	if t, err := time.Parse(time.RFC3339, jsonStr(lastTS, "timestamp")); err == nil {
+		s.End = t.Local()
 	}
 	if s.Start.IsZero() {
 		s.Start = s.End

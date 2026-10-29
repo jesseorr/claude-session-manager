@@ -547,6 +547,7 @@ const (
 	actDiscard
 	actPurge
 	actEmpty
+	actOpen
 )
 
 type model struct {
@@ -999,7 +1000,15 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "O":
-		m.openTargets()
+		if m.trashView {
+			m.notice = "restore it first, then open it"
+		} else if list := m.openList(); len(list) == 0 {
+			m.notice = "nothing to open — mark sessions with space, or bookmark some with p"
+		} else if len(list) <= 5 {
+			m.openTargets()
+		} else {
+			m.action, m.mode = actOpen, modeConfirm
+		}
 	case "c":
 		if m.trashView {
 			m.notice = "these are already closed — t restores, D deletes for good"
@@ -1087,6 +1096,11 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
+		if m.action == actOpen {
+			m.mode = modeList
+			m.openTargets()
+			return m, nil
+		}
 		gone := map[string]bool{}
 		var failed []string
 		victims := m.targets()
@@ -1639,24 +1653,25 @@ func (m model) livePrompt() string {
 	return fmt.Sprintf("Already running as pid %d.  [f] fork it  ·  [r] resume anyway, two writers  ·  [c] close it  ·  [esc]", s.Pid)
 }
 
+// openList is what O opens: the marked sessions, or every bookmark.
+func (m model) openList() []*session {
+	if len(m.marked) > 0 {
+		return m.targets()
+	}
+	var list []*session
+	for _, s := range m.all {
+		if m.pins[s.ID] {
+			list = append(list, s)
+		}
+	}
+	return list
+}
+
 // openTargets resumes the marked sessions, or every bookmark when nothing is
 // marked, each in a tab or window of its own. Running ones are skipped: a
 // second claude on the same transcript would leave two writers.
 func (m *model) openTargets() {
-	if m.trashView {
-		m.notice = "restore it first, then open it"
-		return
-	}
-	var list []*session
-	if len(m.marked) > 0 {
-		list = m.targets()
-	} else {
-		for _, s := range m.all {
-			if m.pins[s.ID] {
-				list = append(list, s)
-			}
-		}
-	}
+	list := m.openList()
 	spaces := map[string]string{}
 	if inHerdr {
 		var err error
@@ -1685,9 +1700,6 @@ func (m *model) openTargets() {
 	m.notice = fmt.Sprintf("opened %d in %s", opened, where)
 	if skipped > 0 {
 		m.notice += fmt.Sprintf(" · skipped %d already running", skipped)
-	}
-	if len(list) == 0 {
-		m.notice = "nothing to open — mark sessions with space, or bookmark some with p"
 	}
 	if len(failed) > 0 {
 		m.err = fmt.Sprintf("%d failed: %s", len(failed), failed[0])
@@ -1750,6 +1762,19 @@ func (m model) emptyState() []string {
 // confirmPrompt spells out exactly what is about to happen, including how many
 // of the targets are running, since only those get a signal.
 func (m model) confirmPrompt() string {
+	if m.action == actOpen {
+		list, live := m.openList(), 0
+		for _, s := range list {
+			if s.Live {
+				live++
+			}
+		}
+		where := "ghostty windows"
+		if inHerdr {
+			where = "herdr"
+		}
+		return fmt.Sprintf("Open %d sessions in %s?  %d already running, skipped.  [y/n]", len(list)-live, where, live)
+	}
 	targets := m.targets()
 	live := 0
 	for _, s := range targets {
