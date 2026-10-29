@@ -89,6 +89,7 @@ func scanFile(path string) *session {
 		}
 	}
 
+	custom := ""
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 256*1024), 32*1024*1024)
 	for sc.Scan() {
@@ -102,13 +103,20 @@ func scanFile(path string) *session {
 			s.Cwd = jsonStr(line, "cwd")
 			s.Branch = jsonStr(line, "gitBranch")
 		}
-		if strings.Contains(line, `"aiTitle":"`) {
+		// Claude Code keeps re-appending its ai-title long after a rename, so a
+		// custom-title (from /rename or cs) has to win regardless of order.
+		if strings.Contains(line, `"customTitle":"`) {
+			custom = jsonStr(line, "customTitle")
+		} else if strings.Contains(line, `"aiTitle":"`) {
 			s.Title = jsonStr(line, "aiTitle")
 		}
 		if strings.Contains(line, `"type":"last-prompt"`) {
 			s.Turns++
 			s.Last = jsonStr(line, "lastPrompt")
 		}
+	}
+	if custom != "" {
+		s.Title = custom
 	}
 	if s.Start.IsZero() {
 		s.Start = s.End
@@ -302,15 +310,15 @@ func promptsFor(id string) []prompt {
 	return out
 }
 
-// rename appends the same ai-title record Claude Code writes itself, so the new
-// name shows up in `claude --resume` too. The file's mtime is restored so a
-// rename does not push the session to the top of the list.
+// rename appends the same custom-title record Claude Code's /rename writes, so
+// the new name shows up in `claude --resume` too. The file's mtime is restored
+// so a rename does not push the session to the top of the list.
 func rename(s *session, title string) error {
 	fi, err := os.Stat(s.File)
 	if err != nil {
 		return err
 	}
-	rec, _ := json.Marshal(map[string]string{"type": "ai-title", "aiTitle": title, "sessionId": s.ID})
+	rec, _ := json.Marshal(map[string]string{"type": "custom-title", "customTitle": title, "sessionId": s.ID})
 
 	f, err := os.OpenFile(s.File, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {

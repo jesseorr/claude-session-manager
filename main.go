@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/charmbracelet/x/ansi"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -137,6 +138,8 @@ func usage() {
   cs --gc           drop session records whose process is gone
   cs --trash        list discarded sessions
   cs --restore ID   put a discarded session back
+  cs pin            bookmark the Claude session this runs inside (! cs pin)
+  cs unpin          remove that bookmark
 
   -v     print the version
   -d N   only sessions active in the last N days (default 7)
@@ -152,7 +155,11 @@ same letter takes things back out. Press ? inside for the rest.
   f      resume a fork  ctrl+a mark junk     c  close (SIGTERM, history kept)
   v      prompts        esc    unwind        D  delete for good, in the trash
   R      rename         r      rescan        ctrl+t  empty the trash
-  /      filter         ctrl+/ search        w  window · s sort · h here
+  /      filter         ctrl+/ search        w  window · h here
+  s      sort by time, size, turns   S  flip the direction   g  group by day, project, none
+  O      open the marked sessions, or every bookmark, in herdr: one workspace
+         per project, a tab per session
+  ←/→    focus the bookmarks pane or the timeline pane (tab flips)
 
 t, p, c and D act on every marked session, or on the highlighted one when
 nothing is marked. Trashed sessions move to ~/.claude/.cs-trash.
@@ -167,6 +174,15 @@ func main() {
 	var query string
 
 	args := os.Args[1:]
+	if len(args) > 0 && (args[0] == "pin" || args[0] == "unpin") {
+		name, err := pinSelf(args[0] == "pin")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "cs "+args[0]+": "+err.Error())
+			os.Exit(1)
+		}
+		fmt.Println(args[0]+"ned:", name)
+		return
+	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-d", "--days":
@@ -222,10 +238,17 @@ func main() {
 	}
 
 	m := model{all: collect(), query: query, pins: pins, days: days, hereOnly: here,
-		sortBy: saved.Sort, cwd: cwd, w: 100, h: 30,
+		sortBy: saved.Sort, groupBy: saved.Group, asc: saved.Asc, cwd: cwd, w: 100, h: 30,
 		marked: map[string]bool{}, files: map[string][]fileEdit{}}
+	// Sort 3 was "project" before grouping split off from sorting.
+	if m.sortBy == 3 {
+		m.sortBy, m.groupBy = sortRecent, groupProject
+	}
 	if m.sortBy < 0 || m.sortBy >= len(sortNames) {
 		m.sortBy = sortRecent
+	}
+	if m.groupBy < 0 || m.groupBy >= len(groupNames) {
+		m.groupBy = groupDay
 	}
 
 	if plain {
@@ -328,7 +351,7 @@ func trunc(s string, n int) string {
 // renderList also reports, for every line, the index of the group heading that
 // line falls under, so a heading scrolled off the top can be pinned back on.
 func (m model) renderList() ([]string, []int, []int) {
-	sessions, cursor, width := m.shown, m.cursor, m.w
+	sessions, cursor, width := m.shown, m.cursor, m.paneW()
 	pins, marked := m.pins, m.marked
 	var cursorFiles []fileEdit
 	if s := m.sel(); s != nil {
@@ -371,17 +394,14 @@ func (m model) renderList() ([]string, []int, []int) {
 		}
 	}
 	for i, s := range sessions {
-		g := dayLabel(s.End)
-		if m.sortBy == sortProject {
-			g = tilde(s.Cwd)
-		}
+		g := m.groupLabel(s)
 		if g != group {
 			group = g
 			if len(lines) > 0 {
 				push("")
 			}
 			head := stBold.Render(g)
-			if m.sortBy != sortProject {
+			if m.groupBy == groupDay {
 				head += "  " + stDim.Render(s.End.Format("2006-01-02"))
 			}
 			groupAt = len(lines)
@@ -501,16 +521,23 @@ const (
 	modeNew
 )
 
-// Sort orders the s key cycles through. Sorting by project also switches the
-// group headings from days to directories.
+// Sort orders the s key cycles through; S flips the direction.
 const (
 	sortRecent = iota
 	sortSize
 	sortTurns
-	sortProject
 )
 
-var sortNames = []string{"recent", "size", "turns", "project"}
+var sortNames = []string{"time", "size", "turns"}
+
+// Groupings the g key cycles through.
+const (
+	groupDay = iota
+	groupProject
+	groupNone
+)
+
+var groupNames = []string{"day", "project", "none"}
 
 // timeframes is the cycle the w key walks; 0 means every session ever.
 var timeframes = []int{1, 7, 30, 90, 0}
@@ -523,44 +550,46 @@ const (
 )
 
 type model struct {
-	all        []*session
-	shown      []*session
-	days       int  // 0 means no time limit
-	hereOnly   bool // only sessions started in cwd
-	cwd        string
-	trashView  bool // showing discarded sessions instead of live ones
-	trashAll   []*session
-	notice     string
-	sortBy     int
-	pinsOnly   bool            // showing bookmarks instead of the timeline
-	hits       map[string]bool // transcript search results; nil means no search
-	hitQuery   string
-	prevQuery  string // what / reverts to when cancelled
-	marked     map[string]bool
-	pins       map[string]bool
-	files      map[string][]fileEdit
-	cursor     int
-	offset     int
-	w, h       int
-	mode       int
-	action     int
-	query      string
-	input      string
-	prompts    []prompt
-	detailAt   int
-	resume     *session
-	fork       bool
-	newStep    int
-	newPick    int
-	newText    string
-	newDir     string // set when the user commits to starting a session here
-	newSuggest []dirSuggest
-	err        string
+	all         []*session
+	shown       []*session
+	days        int  // 0 means no time limit
+	hereOnly    bool // only sessions started in cwd
+	cwd         string
+	trashView   bool // showing discarded sessions instead of live ones
+	trashAll    []*session
+	notice      string
+	sortBy      int
+	groupBy     int
+	asc         bool            // sort smallest / oldest first
+	pinsOnly    bool            // focus is on the bookmarks pane
+	otherCursor int             // cursor of the pane without focus
+	hits        map[string]bool // transcript search results; nil means no search
+	hitQuery    string
+	prevQuery   string // what / reverts to when cancelled
+	marked      map[string]bool
+	pins        map[string]bool
+	files       map[string][]fileEdit
+	cursor      int
+	offset      int
+	w, h        int
+	mode        int
+	action      int
+	query       string
+	input       string
+	prompts     []prompt
+	detailAt    int
+	resume      *session
+	fork        bool
+	newStep     int
+	newPick     int
+	newText     string
+	newDir      string // set when the user commits to starting a session here
+	newSuggest  []dirSuggest
+	err         string
 }
 
 // inScope applies the time window and directory filter that the w and h keys
-// drive. Pinned sessions ignore the window, since pinning says "keep this in
-// front of me" and a cutoff silently dropping it would defeat that.
+// drive. The bookmarks tab ignores both, so a bookmark never ages out of it.
 func (m model) inScope() []*session {
 	var out []*session
 	if m.trashView {
@@ -601,24 +630,47 @@ func (m model) scopeLabel() string {
 	return "all"
 }
 
-// sortShown orders the visible list, pinned rows first so a pin always wins
-// over whatever the s key is currently sorting by.
+func (m model) groupLabel(s *session) string {
+	switch m.groupBy {
+	case groupProject:
+		return tilde(s.Cwd)
+	case groupNone:
+		return ""
+	}
+	return dayLabel(s.End)
+}
+
+// sortShown orders sessions by the s key, then pulls each group together in
+// the order its first member landed, so the group holding the biggest (or
+// newest, or busiest) session leads and rows stay sorted inside every group.
+// renderList draws a heading wherever the label changes, so groups must be
+// contiguous.
 func (m *model) sortShown() {
+	less := func(a, b *session) bool { return a.End.After(b.End) }
 	switch m.sortBy {
 	case sortSize:
-		sort.SliceStable(m.shown, func(i, j int) bool { return m.shown[i].Bytes > m.shown[j].Bytes })
+		less = func(a, b *session) bool { return a.Bytes > b.Bytes }
 	case sortTurns:
-		sort.SliceStable(m.shown, func(i, j int) bool { return m.shown[i].Turns > m.shown[j].Turns })
-	case sortProject:
-		sort.SliceStable(m.shown, func(i, j int) bool {
-			if a, b := m.shown[i].Cwd, m.shown[j].Cwd; a != b {
-				return a < b
-			}
-			return m.shown[i].End.After(m.shown[j].End)
-		})
-	default:
-		sort.SliceStable(m.shown, func(i, j int) bool { return m.shown[i].End.After(m.shown[j].End) })
+		less = func(a, b *session) bool { return a.Turns > b.Turns }
 	}
+	sort.SliceStable(m.shown, func(i, j int) bool {
+		if m.asc {
+			return less(m.shown[j], m.shown[i])
+		}
+		return less(m.shown[i], m.shown[j])
+	})
+	if m.groupBy == groupNone {
+		return
+	}
+	rank := map[string]int{}
+	for _, s := range m.shown {
+		if _, ok := rank[m.groupLabel(s)]; !ok {
+			rank[m.groupLabel(s)] = len(rank)
+		}
+	}
+	sort.SliceStable(m.shown, func(i, j int) bool {
+		return rank[m.groupLabel(m.shown[i])] < rank[m.groupLabel(m.shown[j])]
+	})
 }
 
 func (m *model) apply() {
@@ -667,7 +719,7 @@ func (m model) targets() []*session {
 // scroll keeps the highlighted session's block inside the viewport. It runs on
 // every key so the offset survives into the next View.
 func (m *model) scroll() {
-	body := m.h - 2
+	body := m.listBody()
 	if body < 4 || len(m.shown) == 0 {
 		return
 	}
@@ -713,7 +765,7 @@ func tick() tea.Cmd {
 }
 
 func (m model) savePrefs() {
-	savePrefs(prefs{Days: m.days, Here: m.hereOnly, Sort: m.sortBy})
+	savePrefs(prefs{Days: m.days, Here: m.hereOnly, Sort: m.sortBy, Group: m.groupBy, Asc: m.asc})
 }
 
 func (m *model) refreshLive() {
@@ -821,11 +873,10 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case m.query != "":
 			m.query, m.cursor = "", 0
 			m.apply()
-		case m.trashView || m.pinsOnly:
-			m.trashView, m.pinsOnly, m.trashAll = false, false, nil
-			m.cursor, m.offset = 0, 0
-			m.apply()
-			m.loadFiles()
+		case m.trashView:
+			m.trash(false)
+		case m.pinsOnly:
+			m.focus(false)
 		default:
 			return m, tea.Quit
 		}
@@ -837,7 +888,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor < len(m.shown)-1 {
 			m.cursor++
 		}
-	case "g", "home":
+	case "home":
 		m.cursor = 0
 	case "G", "end":
 		m.cursor = len(m.shown) - 1
@@ -906,7 +957,19 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor, m.offset = 0, 0
 		m.apply()
 		m.savePrefs()
-		m.notice = "sorted by " + sortNames[m.sortBy]
+		m.notice = "sorted by " + m.sortLabel()
+	case "S":
+		m.asc = !m.asc
+		m.cursor, m.offset = 0, 0
+		m.apply()
+		m.savePrefs()
+		m.notice = "sorted by " + m.sortLabel()
+	case "g":
+		m.groupBy = (m.groupBy + 1) % len(groupNames)
+		m.cursor, m.offset = 0, 0
+		m.apply()
+		m.savePrefs()
+		m.notice = "grouped by " + groupNames[m.groupBy]
 	case "ctrl+_", "ctrl+/":
 		m.input, m.mode = "", modeSearch
 	case "p":
@@ -925,8 +988,18 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.err = err.Error()
 		}
 		m.marked = map[string]bool{}
+		// The row moves into or out of the bookmarks block, so follow it there
+		// rather than leaving the cursor on whatever slid into its old index.
+		cur := m.sel()
 		m.apply()
 		m.cursor = min(m.cursor, max(0, len(m.shown)-1))
+		for i, s := range m.shown {
+			if s == cur {
+				m.cursor = i
+			}
+		}
+	case "O":
+		m.openTargets()
 	case "c":
 		if m.trashView {
 			m.notice = "these are already closed — t restores, D deletes for good"
@@ -974,10 +1047,12 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.cursor, m.offset = 0, 0
 		m.apply()
-	case "P":
-		m.pinsOnly, m.trashView = !m.pinsOnly, false
-		m.cursor, m.offset = 0, 0
-		m.apply()
+	case "P", "tab", "shift+tab":
+		m.focus(!m.pinsOnly)
+	case "left":
+		m.focus(true)
+	case "right":
+		m.focus(false)
 
 	case "ctrl+a":
 		n := 0
@@ -988,17 +1063,10 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if n == 0 {
 			m.notice = "nothing to prune in this scope"
 		}
+	// The footer already names the keys for the view being entered, so a
+	// notice here would only cover it up.
 	case "T":
-		m.trashView, m.pinsOnly = !m.trashView, false
-		m.trashAll = nil
-		if m.trashView {
-			m.trashAll = trashSessions()
-		}
-		m.cursor, m.offset, m.marked = 0, 0, map[string]bool{}
-		m.apply()
-		m.loadFiles()
-		// The footer already names the keys for the view being entered, so a
-		// notice here would only cover it up.
+		m.trash(!m.trashView)
 	case "ctrl+g":
 		m.notice = fmt.Sprintf("cleared %d stale session records", gcRecords())
 		if !hasProc {
@@ -1232,10 +1300,11 @@ func helpLines() []string {
 		stDim.Render("   exists and the start time matches. It is not a self-reported label,"),
 		stDim.Render("   so it cannot go stale the way \"working\" or \"needs input\" can."),
 		"",
-		head("Three views"),
-		key("", "the timeline, and two others you toggle into and out of:"),
+		head("Panes"),
+		key("\u2190/\u2192", "focus bookmarks (left) or the timeline (right); tab flips"),
 		key("T", "trash \u2014 discarded sessions, still recoverable"),
 		key("P", "bookmarks \u2014 starred sessions, at any age and any directory"),
+		key("", "cs pin, typed as ! cs pin in a chat, bookmarks that chat"),
 		"",
 		stDim.Render("   Shift opens a view, the plain letter is the verb that puts things"),
 		stDim.Render("   in it: t trashes, p bookmarks. Inside the view the same letter"),
@@ -1246,12 +1315,15 @@ func helpLines() []string {
 		"",
 		head("Moving"),
 		key("j k \u2191 \u2193", "one row      ctrl+u ctrl+d   half a page"),
-		key("g G", "first, last"),
+		key("home G", "first, last"),
 		"",
 		head("Opening"),
 		key("enter", "resume it, in the directory it ran in"),
 		key("n", "start a new session \u2014 suggests directories, creates one if needed"),
 		key("f", "resume as a fork, leaving the original transcript alone"),
+		key("O", "open the marked sessions, or every bookmark, as herdr tabs in one"),
+		key("", "workspace per project (ghostty windows outside herdr); running"),
+		key("", "ones are skipped"),
 		key("v", "replay every prompt you typed in it"),
 		key("R", "rename \u2014 the new name shows in claude --resume too"),
 		"",
@@ -1281,7 +1353,9 @@ func helpLines() []string {
 		key("ctrl+/", "search the transcript bodies themselves"),
 		key("w", "time window: today, 7d, 30d, 90d, all"),
 		key("h", "only this directory, or everywhere"),
-		key("s", "sort: recent, size, turns, project"),
+		key("s", "sort: time, size, turns"),
+		key("S", "flip the sort direction"),
+		key("g", "group: day, project, none"),
 		"",
 		head("Housekeeping"),
 		key("r", "rescan everything from disk"),
@@ -1324,7 +1398,7 @@ func (m model) View() string {
 		return m.viewNew()
 	}
 
-	body := m.h - 2
+	body := m.listBody()
 	lines, _, under := m.renderList()
 	if len(m.shown) == 0 {
 		lines = m.emptyState()
@@ -1342,7 +1416,7 @@ func (m model) View() string {
 	}
 	// Pin the heading of whatever group the top row belongs to; scrolling into
 	// a long project otherwise leaves rows with no visible label.
-	if len(view) > 0 && off > 0 && off < len(under) && under[off] < off {
+	if m.groupBy != groupNone && len(view) > 0 && off > 0 && off < len(under) && under[off] < off {
 		view[0] = lines[under[off]] + stDim.Render("  ↑")
 	}
 
@@ -1364,8 +1438,11 @@ func (m model) View() string {
 			title += "  ·  " + tilde(m.cwd)
 		}
 	}
-	if m.sortBy != sortRecent {
-		title += "  ·  by " + sortNames[m.sortBy]
+	if m.sortBy != sortRecent || m.asc {
+		title += "  ·  by " + m.sortLabel()
+	}
+	if m.groupBy != groupDay {
+		title += "  ·  grouped by " + groupNames[m.groupBy]
 	}
 	if m.hitQuery != "" {
 		title += "  ·  mentions " + strconv.Quote(m.hitQuery)
@@ -1403,13 +1480,219 @@ func (m model) View() string {
 	case m.err != "":
 		foot = bar(stBarErr, m.w, m.err)
 	}
-	return head + "\n" + strings.Join(view, "\n") +
+	if m.split() {
+		view = m.joinPanes(view, body)
+	}
+	return head + "\n" + m.paneHeads() + "\n" + strings.Join(view, "\n") +
 		strings.Repeat("\n", max(1, body-len(view)+1)) + foot
+}
+
+// listBody is the rows left for the list once the pane headings, header and
+// footer are drawn. View and scroll must agree on it or the cursor drifts
+// offscreen.
+func (m model) listBody() int { return m.h - 3 }
+
+// split reports whether bookmarks and the timeline share the screen. The trash
+// stays full width, and below 100 columns the narrow pane is a sliver.
+func (m model) split() bool { return !m.trashView && m.w >= 100 }
+
+// paneW is the focused pane's width; the other pane gets the rest, less one
+// column for the divider.
+func (m model) paneW() int {
+	if !m.split() {
+		return m.w
+	}
+	return m.w * 85 / 100
+}
+
+// fit pads or cuts a styled line to exactly w columns so the divider lines up.
+func fit(s string, w int) string {
+	s = ansi.Truncate(s, w, "")
+	return s + strings.Repeat(" ", max(0, w-ansi.StringWidth(s)))
+}
+
+// sides orders a (focused, other) pair into (left, right). Bookmarks are
+// always on the left, whichever side has focus.
+func (m model) sides(focused, other string) (string, string) {
+	if m.pinsOnly {
+		return focused, other
+	}
+	return other, focused
+}
+
+// joinPanes lays the focused pane's rows beside a compact list of the other
+// pane. The other pane is rebuilt from scratch on every frame so bookmarking
+// from the timeline shows up on the left at once.
+func (m model) joinPanes(focused []string, body int) []string {
+	fw := m.paneW()
+	ow := m.w - fw - 1
+	other := m
+	other.pinsOnly, other.cursor = !m.pinsOnly, m.otherCursor
+	other.apply()
+	compact := other.compactList(ow, body)
+	out := make([]string, body)
+	for i := range out {
+		f, o := "", ""
+		if i < len(focused) {
+			f = focused[i]
+		}
+		if i < len(compact) {
+			o = compact[i]
+		}
+		l, r := m.sides(fit(f, fw), fit(o, ow))
+		out[i] = l + stDim.Render("│") + r
+	}
+	return out
+}
+
+// compactList is the unfocused pane: one dim line per session, kept centred
+// on where its cursor was left.
+func (m model) compactList(w, body int) []string {
+	if len(m.shown) == 0 {
+		what := "no sessions"
+		if m.pinsOnly {
+			what = "no bookmarks — p adds one"
+		}
+		return []string{"", stDim.Render("  " + what)}
+	}
+	start := max(0, min(m.cursor-body/2, len(m.shown)-body))
+	var out []string
+	for i := start; i < len(m.shown) && len(out) < body; i++ {
+		s := m.shown[i]
+		t := s.Title
+		if t == "" {
+			t = "(untitled)"
+		}
+		if !m.pinsOnly && m.pins[s.ID] {
+			t = "★ " + t
+		}
+		cur := "  "
+		if i == m.cursor {
+			cur = "▸ "
+		}
+		live := ""
+		if s.Live {
+			live = stGreen.Render(" ●")
+		}
+		out = append(out, stDim.Render(trunc(fmt.Sprintf("%s%2d  %s", cur, i+1, t), w-3))+live)
+	}
+	return out
+}
+
+// paneHeads labels each pane above its column, the focused one lit.
+func (m model) paneHeads() string {
+	n := 0
+	for _, s := range m.all {
+		if m.pins[s.ID] {
+			n++
+		}
+	}
+	lit := func(t string, on bool) string {
+		if on {
+			return stBold.Reverse(true).Render(t)
+		}
+		return stDim.Render(t)
+	}
+	bm, tl := fmt.Sprintf(" ★ Bookmarks %d ", n), " Timeline "
+	switch {
+	case m.trashView:
+		return lit(" Trash ", true) + stDim.Render("   T or esc goes back")
+	case !m.split():
+		return lit(bm, m.pinsOnly) + " " + lit(tl, !m.pinsOnly) + stDim.Render("   ←/→")
+	}
+	fw := m.paneW()
+	f, o := tl, bm
+	if m.pinsOnly {
+		f, o = bm, tl
+	}
+	l, r := m.sides(fit(lit(f, true)+stDim.Render("   ←/→"), fw), fit(lit(o, false), m.w-fw-1))
+	return l + stDim.Render("│") + r
+}
+
+// focus moves between the bookmarks and timeline panes. Each pane keeps its
+// own cursor, so flipping back lands where you left it.
+func (m *model) focus(bookmarks bool) {
+	if m.trashView || m.pinsOnly == bookmarks {
+		return
+	}
+	m.pinsOnly = bookmarks
+	m.cursor, m.otherCursor = m.otherCursor, m.cursor
+	m.offset, m.marked = 0, map[string]bool{}
+	m.apply()
+	m.loadFiles()
+}
+
+// trash enters or leaves the full-width trash view, which always returns to
+// the timeline.
+func (m *model) trash(on bool) {
+	m.trashView, m.pinsOnly, m.trashAll = on, false, nil
+	if on {
+		m.trashAll = trashSessions()
+	}
+	m.cursor, m.otherCursor, m.offset, m.marked = 0, 0, 0, map[string]bool{}
+	m.apply()
+	m.loadFiles()
 }
 
 func (m model) livePrompt() string {
 	s := m.sel()
 	return fmt.Sprintf("Already running as pid %d.  [f] fork it  ·  [r] resume anyway, two writers  ·  [c] close it  ·  [esc]", s.Pid)
+}
+
+// openTargets resumes the marked sessions, or every bookmark when nothing is
+// marked, each in a tab or window of its own. Running ones are skipped: a
+// second claude on the same transcript would leave two writers.
+func (m *model) openTargets() {
+	if m.trashView {
+		m.notice = "restore it first, then open it"
+		return
+	}
+	var list []*session
+	if len(m.marked) > 0 {
+		list = m.targets()
+	} else {
+		for _, s := range m.all {
+			if m.pins[s.ID] {
+				list = append(list, s)
+			}
+		}
+	}
+	spaces := map[string]string{}
+	if inHerdr {
+		var err error
+		if spaces, err = herdrSpaces(); err != nil {
+			m.err = err.Error()
+			return
+		}
+	}
+	opened, skipped := 0, 0
+	var failed []string
+	for _, s := range list {
+		if s.Live {
+			skipped++
+			continue
+		}
+		if err := openElsewhere(s, spaces); err != nil {
+			failed = append(failed, err.Error())
+			continue
+		}
+		opened++
+	}
+	where := "ghostty windows"
+	if inHerdr {
+		where = "herdr, one workspace per project"
+	}
+	m.notice = fmt.Sprintf("opened %d in %s", opened, where)
+	if skipped > 0 {
+		m.notice += fmt.Sprintf(" · skipped %d already running", skipped)
+	}
+	if len(list) == 0 {
+		m.notice = "nothing to open — mark sessions with space, or bookmark some with p"
+	}
+	if len(failed) > 0 {
+		m.err = fmt.Sprintf("%d failed: %s", len(failed), failed[0])
+	}
+	m.marked = map[string]bool{}
 }
 
 // restoreTargets pulls the marked (or highlighted) sessions back out of the
@@ -1438,9 +1721,9 @@ func (m model) footerKeys() string {
 	case m.trashView:
 		return "? keys · t restore · D delete for good · ctrl+t empty the trash · space mark · esc back to timeline"
 	case m.pinsOnly:
-		return "? keys · enter resume · p unbookmark · v prompts · space mark · esc back to timeline · q quit"
+		return "? keys · enter resume · O open all · p unbookmark · v prompts · space mark · → timeline · q quit"
 	}
-	return "? keys · enter resume · n new · space mark · t trash it · p bookmark · c close · T trash · P bookmarks · q quit"
+	return "? keys · enter resume · n new · space mark · t trash it · p bookmark · O open · c close · ← bookmarks · T trash · q quit"
 }
 
 // emptyState explains an empty list. Every filter that can empty it also has a
@@ -1572,4 +1855,11 @@ func wrap(s string, n int) []string {
 // backwards.
 func stamp(label string, t time.Time) string {
 	return label + " " + t.Format("01-02 15:04")
+}
+
+func (m model) sortLabel() string {
+	if m.asc {
+		return sortNames[m.sortBy] + " ↑"
+	}
+	return sortNames[m.sortBy] + " ↓"
 }

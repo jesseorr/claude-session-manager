@@ -35,6 +35,14 @@ func TestRenamePreservesMtimeAndWins(t *testing.T) {
 	if got := scanFile(path); got.Title != `new "quoted" title` {
 		t.Fatalf("title after rename: %q", got.Title)
 	}
+	// Claude Code re-appends its ai-title after a rename; the rename must hold.
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	f.WriteString(`{"type":"ai-title","aiTitle":"old title","sessionId":"abc-123"}` + "\n")
+	f.Close()
+	if got := scanFile(path); got.Title != `new "quoted" title` {
+		t.Fatalf("ai-title overrode rename: %q", got.Title)
+	}
+	os.Chtimes(path, want, want)
 	fi, _ := os.Stat(path)
 	if !fi.ModTime().Truncate(time.Second).Equal(want) {
 		t.Fatalf("mtime moved: %v want %v", fi.ModTime(), want)
