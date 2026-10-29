@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -176,9 +178,11 @@ func restore(prefix string) error {
 // prefs are the view settings the w, h and s keys change, kept so the list opens
 // the way it was left.
 type prefs struct {
-	Days int  `json:"days"`
-	Here bool `json:"here"`
-	Sort int  `json:"sort"`
+	Days  int  `json:"days"`
+	Here  bool `json:"here"`
+	Sort  int  `json:"sort"`
+	Group int  `json:"group"`
+	Asc   bool `json:"asc"`
 }
 
 func loadPrefs() prefs {
@@ -391,4 +395,184 @@ func purge(s *session) error {
 	}
 	os.RemoveAll(strings.TrimSuffix(s.File, ".jsonl"))
 	return os.Remove(s.File)
+}
+
+// procParent returns a pid's parent, or 0 when the pid is gone.
+func procParent(pid int) int {
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	i := strings.LastIndex(string(stat), ")")
+	if i < 0 {
+		return 0
+	}
+	if fields := strings.Fields(string(stat)[i+1:]); len(fields) > 1 {
+		ppid, _ := strconv.Atoi(fields[1])
+		return ppid
+	}
+	return 0
+}
+
+// ancestorSession walks up from pid to the Claude Code process that owns it.
+// `! cs pin` runs under a shell that claude spawned, possibly several levels
+// down, so the direct parent is rarely the session process itself.
+func ancestorSession(pid int, live map[string]liveRecord) string {
+	byPid := map[int]string{}
+	for id, rec := range live {
+		if rec.Alive {
+			byPid[rec.Pid] = id
+		}
+	}
+	for ; pid > 1; pid = procParent(pid) {
+		if id, ok := byPid[pid]; ok {
+			return id
+		}
+	}
+	return ""
+}
+
+// pinSelf bookmarks (or unbookmarks) the session cs was run from and returns
+// what to call it.
+func pinSelf(on bool) (string, error) {
+	if !hasProc {
+		return "", fmt.Errorf("finding the calling session needs /proc, which this system does not have")
+	}
+	id := ancestorSession(os.Getppid(), liveRecords())
+	if id == "" {
+		return "", fmt.Errorf("not inside a running Claude Code session: no parent process matches ~/.claude/sessions")
+	}
+	pins := loadPins()
+	if on {
+		pins[id] = true
+	} else {
+		delete(pins, id)
+	}
+	if err := savePins(pins); err != nil {
+		return "", err
+	}
+	if files, _ := filepath.Glob(filepath.Join(projectsDir, "*", id+".jsonl")); len(files) > 0 {
+		if s := scanFile(files[0]); s != nil && s.Title != "" {
+			return s.Title, nil
+		}
+	}
+	return id, nil
+}
+
+var inHerdr = os.Getenv("HERDR_ENV") == "1"
+
+func tabLabel(s *session) string {
+	if s.Title == "" {
+		return s.ID[:min(8, len(s.ID))]
+	}
+	return trunc(s.Title, 32)
+}
+
+// spaceLabel names the herdr workspace a session opens in: one per project,
+// matched by the directory's base name.
+func spaceLabel(s *session) string { return filepath.Base(s.Cwd) }
+
+// herdrArgs opens the session as a tab in its project's workspace, or creates
+// that workspace when none is open. A new workspace's first tab takes the
+// session, so no empty shell tab is left behind.
+func herdrArgs(s *session, spaces map[string]string) []string {
+	if ws, ok := spaces[spaceLabel(s)]; ok {
+		return []string{"tab", "create", "--workspace", ws, "--cwd", s.Cwd, "--label", tabLabel(s), "--no-focus"}
+	}
+	return []string{"workspace", "create", "--cwd", s.Cwd, "--label", spaceLabel(s), "--no-focus"}
+}
+
+// herdrSpaces maps workspace label to id for every workspace open now.
+func herdrSpaces() (map[string]string, error) {
+	out, err := exec.Command("herdr", "workspace", "list").Output()
+	if err != nil {
+		return nil, fmt.Errorf("herdr workspace list: %w", err)
+	}
+	return parseSpaces(out)
+}
+
+func parseSpaces(out []byte) (map[string]string, error) {
+	var r struct {
+		Result struct {
+			Workspaces []struct {
+				ID    string `json:"workspace_id"`
+				Label string `json:"label"`
+			} `json:"workspaces"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &r); err != nil {
+		return nil, err
+	}
+	spaces := map[string]string{}
+	for _, w := range r.Result.Workspaces {
+		spaces[w.Label] = w.ID
+	}
+	return spaces, nil
+}
+
+func ghosttyArgs(s *session) []string {
+	return []string{"--working-directory=" + s.Cwd, "-e", "claude", "--resume", s.ID}
+}
+
+// created is what `herdr tab create` and `herdr workspace create` return;
+// Workspace is only set by the latter.
+type created struct {
+	Workspace string
+	Tab       string
+	Pane      string
+}
+
+func parseCreated(out []byte) (created, error) {
+	var r struct {
+		Result struct {
+			Workspace struct {
+				ID string `json:"workspace_id"`
+			} `json:"workspace"`
+			Tab struct {
+				ID string `json:"tab_id"`
+			} `json:"tab"`
+			RootPane struct {
+				ID string `json:"pane_id"`
+			} `json:"root_pane"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &r); err != nil {
+		return created{}, err
+	}
+	c := created{r.Result.Workspace.ID, r.Result.Tab.ID, r.Result.RootPane.ID}
+	if c.Pane == "" {
+		return c, fmt.Errorf("herdr returned no pane id")
+	}
+	return c, nil
+}
+
+// openElsewhere resumes a session in herdr, in its project's workspace, or in
+// a new ghostty window outside herdr, leaving this picker running. spaces is
+// updated as workspaces are created so a project's later sessions join them.
+func openElsewhere(s *session, spaces map[string]string) error {
+	if inHerdr {
+		args := herdrArgs(s, spaces)
+		out, err := exec.Command("herdr", args...).Output()
+		if err != nil {
+			return fmt.Errorf("herdr %s %s: %w", args[0], args[1], err)
+		}
+		c, err := parseCreated(out)
+		if err != nil {
+			return err
+		}
+		if c.Workspace != "" {
+			spaces[spaceLabel(s)] = c.Workspace
+			exec.Command("herdr", "tab", "rename", c.Tab, tabLabel(s)).Run()
+		}
+		return exec.Command("herdr", "pane", "run", c.Pane, "claude --resume "+s.ID).Run()
+	}
+	c := exec.Command("ghostty", ghosttyArgs(s)...)
+	c.Dir = s.Cwd
+	// Its own session, so the window outlives cs and never reads our terminal.
+	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := c.Start(); err != nil {
+		return err
+	}
+	go c.Wait()
+	return nil
 }

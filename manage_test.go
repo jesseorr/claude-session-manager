@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"github.com/charmbracelet/x/ansi"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // withTempStore points the package-level paths at a scratch directory so no
@@ -207,5 +210,117 @@ func TestLiveRecordNeedsBothStartTimes(t *testing.T) {
 	}
 	if !got["proven"].Alive {
 		t.Error("a record whose procStart matches must count as alive")
+	}
+}
+
+func TestAncestorSessionWalksUpThePidChain(t *testing.T) {
+	if !hasProc {
+		t.Skip("needs /proc")
+	}
+	if got := procParent(os.Getpid()); got != os.Getppid() {
+		t.Fatalf("procParent: got %d, want %d", got, os.Getppid())
+	}
+	// The test binary's parent stands in for claude; the walk starts from us,
+	// one level below it, the way `! cs pin` starts below its shell.
+	live := map[string]liveRecord{
+		"mine":  {Pid: os.Getppid(), Alive: true},
+		"stale": {Pid: os.Getpid(), Alive: false},
+	}
+	if got := ancestorSession(os.Getpid(), live); got != "mine" {
+		t.Fatalf("got %q, want mine", got)
+	}
+	if got := ancestorSession(os.Getpid(), map[string]liveRecord{}); got != "" {
+		t.Fatalf("no records should match nothing, got %q", got)
+	}
+}
+
+func TestOpenCommands(t *testing.T) {
+	s := &session{ID: "abc-123", Cwd: "/work/api", Title: "Trace the retry loop"}
+	want := "workspace create --cwd /work/api --label api --no-focus"
+	if got := strings.Join(herdrArgs(s, map[string]string{}), " "); got != want {
+		t.Fatalf("herdr new space: %q", got)
+	}
+	spaces, err := parseSpaces([]byte(`{"result":{"type":"workspace_list","workspaces":[{"workspace_id":"w3","label":"api"}]}}`))
+	if err != nil || spaces["api"] != "w3" {
+		t.Fatalf("parseSpaces: %v %v", spaces, err)
+	}
+	want = "tab create --workspace w3 --cwd /work/api --label Trace the retry loop --no-focus"
+	if got := strings.Join(herdrArgs(s, spaces), " "); got != want {
+		t.Fatalf("herdr existing space: %q", got)
+	}
+	want = "--working-directory=/work/api -e claude --resume abc-123"
+	if got := strings.Join(ghosttyArgs(s), " "); got != want {
+		t.Fatalf("ghostty: %q", got)
+	}
+	c, err := parseCreated([]byte(`{"result":{"workspace":{"workspace_id":"w5"},"tab":{"tab_id":"w5:t1"},"root_pane":{"pane_id":"w5:p1"}}}`))
+	if err != nil || c != (created{"w5", "w5:t1", "w5:p1"}) {
+		t.Fatalf("parseCreated: %+v %v", c, err)
+	}
+	if _, err := parseCreated([]byte(`{"result":{}}`)); err == nil {
+		t.Fatal("missing pane id must be an error")
+	}
+}
+
+func TestPanesKeepTheirCursorsAndLineUp(t *testing.T) {
+	now := time.Now()
+	all := []*session{
+		{ID: "a", Title: "alpha", End: now, Turns: 5},
+		{ID: "b", Title: "beta", End: now.Add(-time.Hour), Turns: 5},
+		{ID: "old-pin", Title: "pinned long ago", End: now.AddDate(0, 0, -60), Turns: 5},
+	}
+	m := model{all: all, days: 7, w: 120, h: 20, pins: map[string]bool{"old-pin": true},
+		marked: map[string]bool{}, files: map[string][]fileEdit{}}
+	m.apply()
+	if len(m.shown) != 2 {
+		t.Fatalf("timeline should respect the window: %v", m.shown)
+	}
+	m.cursor = 1
+	m.focus(true)
+	if !m.pinsOnly || len(m.shown) != 1 || m.shown[0].ID != "old-pin" || m.cursor != 0 {
+		t.Fatalf("bookmarks pane: pinsOnly=%v cursor=%d shown=%v", m.pinsOnly, m.cursor, m.shown)
+	}
+	m.focus(false)
+	if m.pinsOnly || m.cursor != 1 {
+		t.Fatalf("timeline cursor not kept: %d", m.cursor)
+	}
+
+	rows := strings.Split(m.View(), "\n")
+	for _, r := range rows[:len(rows)-1] {
+		if w := ansi.StringWidth(r); w > m.w {
+			t.Fatalf("row %d wide: %q", w, r)
+		}
+	}
+	at := strings.Index(rows[1], "│")
+	if at < 0 || !strings.Contains(strings.Join(rows, "\n"), "pinned") {
+		t.Fatalf("split not drawn:\n%s", strings.Join(rows, "\n"))
+	}
+}
+
+func TestGroupByProjectKeepsGroupsContiguousAndSorted(t *testing.T) {
+	now := time.Now()
+	all := []*session{
+		{ID: "a1", Cwd: "/a", Bytes: 10, End: now, Turns: 1},
+		{ID: "b1", Cwd: "/b", Bytes: 50, End: now, Turns: 1},
+		{ID: "a2", Cwd: "/a", Bytes: 30, End: now, Turns: 1},
+		{ID: "b2", Cwd: "/b", Bytes: 5, End: now, Turns: 1},
+	}
+	m := model{all: all, sortBy: sortSize, groupBy: groupProject, pins: map[string]bool{},
+		marked: map[string]bool{}, files: map[string][]fileEdit{}}
+	m.apply()
+	var got []string
+	for _, s := range m.shown {
+		got = append(got, s.ID)
+	}
+	if strings.Join(got, " ") != "b1 b2 a2 a1" {
+		t.Fatalf("desc: %v", got)
+	}
+	m.asc = true
+	m.apply()
+	got = got[:0]
+	for _, s := range m.shown {
+		got = append(got, s.ID)
+	}
+	if strings.Join(got, " ") != "b2 b1 a1 a2" {
+		t.Fatalf("asc: %v", got)
 	}
 }
